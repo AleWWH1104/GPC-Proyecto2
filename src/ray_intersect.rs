@@ -28,9 +28,7 @@ impl Intersect {
             normal: Vector3::zero(),
             distance: 0.0,
             is_intersecting: false,
-            material: Material {
-                diffuse: Vector3::zero(),
-            },
+            material: Material::black(),
         }
     }
 }

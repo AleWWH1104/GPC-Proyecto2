@@ -3,11 +3,25 @@ use raylib::prelude::{Color, Vector3};
 #[derive(Debug, Clone, Copy)]
 pub struct Material {
     pub diffuse: Vector3,
+    pub albedo: [f32; 2],
+    pub specular: f32,
 }
 
 impl Material {
-    pub fn new(diffuse: Vector3) -> Self {
-        Material { diffuse }
+    pub fn new(diffuse: Vector3, specular: f32, albedo: [f32; 2]) -> Self {
+        Material {
+            diffuse,
+            albedo,
+            specular,
+        }
+    }
+
+    pub fn black() -> Self {
+        Material {
+            diffuse: Vector3::zero(),
+            albedo: [0.0, 0.0],
+            specular: 0.0,
+        }
     }
 }
 
