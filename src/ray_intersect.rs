@@ -1,34 +1,38 @@
-use raylib::prelude::Vector3;
+// ray_intersect.rs
+use raylib::prelude::{Color, Vector2, Vector3}; // <-- Añade Vector2
 use crate::material::Material;
 
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 pub struct Intersect {
-    pub point: Vector3,
-    pub normal: Vector3,
+    pub material: Material,
     pub distance: f32,
     pub is_intersecting: bool,
-    pub material: Material,
+    pub normal: Vector3,
+    pub point: Vector3,
+    pub uv: Option<Vector2>, // <-- Añade esta línea
 }
 
 impl Intersect {
-    pub fn new(point: Vector3, normal: Vector3, distance: f32, material: Material) -> Self {
+    pub fn new(material: Material, distance: f32, normal: Vector3, point: Vector3, uv: Option<Vector2>) -> Self {
         Intersect {
-            point,
-            normal,
+            material,
             distance,
             is_intersecting: true,
-            material,
+            normal,
+            point,
+            uv, // <-- Añade esta línea
         }
     }
 
     pub fn empty() -> Self {
         Intersect {
-            point: Vector3::zero(),
-            normal: Vector3::zero(),
+            material: Material::black(),
             distance: 0.0,
             is_intersecting: false,
-            material: Material::black(),
+            normal: Vector3::zero(),
+            point: Vector3::zero(),
+            uv: None, // <-- Añade esta línea
         }
     }
 }

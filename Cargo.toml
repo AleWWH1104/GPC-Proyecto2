@@ -5,3 +5,5 @@ edition = "2024"
 
 [dependencies]
 raylib = "5.5.1"
+anyhow = "1"
+image = { version = "0.24", default-features = false, features = ["png", "jpeg"] }
