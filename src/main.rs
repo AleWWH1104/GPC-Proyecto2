@@ -3,6 +3,9 @@
 
 use raylib::prelude::*;
 use std::f32::consts::PI;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use rayon::prelude::*;
 
 mod framebuffer;
 mod ray_intersect;
@@ -20,6 +23,126 @@ use material::{Material, vector3_to_color, color_to_vector3};
 use light::Light;
 use texture::TextureManager;
 
+
+// --- AÑADIDO: estado global de animación ---
+struct SceneState {
+    time: f32,
+    scene_rotation: f32,
+    camera_distance: f32, // distancia base desde center -> eye
+    camera_center: Vector3,
+}
+
+impl SceneState {
+    fn new() -> Self {
+        SceneState {
+            time: 0.0,
+            scene_rotation: 0.0,
+            camera_distance: 10.0,
+            camera_center: Vector3::new(-0.5, 1.1, 1.0),
+        }
+    }
+
+    // Actualiza posición del sol y colores según el tiempo
+    fn update(&mut self, dt: f32) {
+        self.time += dt;
+        // Un ciclo completo cada 10 segundos
+        let cycle = (self.time / 10.0) % 1.0;
+        // Rotamos la escena
+        self.scene_rotation += dt * (2.0 * PI / 30.0);
+    }
+
+    // Obtiene posición del sol (en esfera de radio 20)
+    fn sun_position(&self) -> Vector3 {
+        let cycle = (self.time / 10.0) % 1.0;
+        let angle = cycle * 2.0 * PI - PI / 2.0; // sale por el este
+        Vector3::new(
+            20.0 * angle.cos(),
+            20.0 * (angle.sin() + 1.0) * 0.5, // sube y baja
+            0.0,
+        )
+    }
+
+    fn background_color(&self) -> Color {
+        let cycle = (self.time / 10.0) % 1.0; // 10 segundos por ciclo
+        // 0.0 = noche, 0.25 = amanecer, 0.5 = día, 0.75 = atardecer, 1.0 = noche
+
+        if cycle < 0.25 {
+            // Noche → Amanecer (morado → rosa)
+            let t = cycle / 0.25;
+            // Morado oscuro → Rosa claro
+            Color::new(
+                (80.0 + 175.0 * t) as u8, // R: morado → rosa
+                (40.0 + 140.0 * t) as u8, // G: oscuro → claro
+                (100.0 + 155.0 * t) as u8, // B: morado → rosa
+                255,
+            )
+        } else if cycle < 0.5 {
+            // Amanecer → Día (rosa → celeste)
+            let t = (cycle - 0.25) / 0.25;
+            Color::new(
+                (255.0 - 100.0 * t) as u8, // R: rosa → azul
+                (180.0 + 75.0 * t) as u8, // G: más verde
+                (255.0 - 50.0 * t) as u8, // B: rosa → celeste
+                255,
+            )
+        } else if cycle < 0.75 {
+            // Día → Atardecer
+            let t = (cycle - 0.5) / 0.25;
+            Color::new(
+                (155.0 + 100.0 * (1.0 - t)) as u8, // Rosa de nuevo
+                (255.0 - 75.0 * t) as u8,
+                (205.0 - 105.0 * t) as u8,
+                255,
+            )
+        } else {
+            // Atardecer → Noche
+            let t = (cycle - 0.75) / 0.25;
+            Color::new(
+                (255.0 - 175.0 * t) as u8, // Rosa → morado
+                (180.0 - 140.0 * t) as u8,
+                (100.0 + 55.0 * (1.0 - t)) as u8,
+                255,
+            )
+        }
+    }
+
+    fn sun_color(&self) -> Color {
+        let cycle = (self.time / 10.0) % 1.0;
+        if cycle < 0.2 || cycle > 0.8 {
+            Color::BLACK // noche → sol abajo
+        } else if cycle < 0.3 {
+            Color::new(255, 200, 100, 255) // amanecer
+        } else if cycle < 0.7 {
+            Color::new(255, 255, 200, 255) // día
+        } else {
+            Color::new(255, 200, 100, 255) // atardecer
+        }
+    }
+
+    fn light_intensity(&self) -> f32 {
+        let cycle = (self.time / 10.0) % 1.0;
+        if cycle < 0.2 {
+            0.1 * (cycle / 0.2) // amanecer
+        } else if cycle < 0.5 {
+            0.1 + 0.9 * ((cycle - 0.2) / 0.3) // sube a día
+        } else if cycle < 0.8 {
+            1.0 - 0.9 * ((cycle - 0.5) / 0.3) // baja a noche
+        } else {
+            0.1 * (1.0 - (cycle - 0.8) / 0.2) // atardecer
+        }
+    }
+}
+
+// --- NUEVA FUNCIÓN: rotar punto en XZ alrededor de Y ---
+fn rotate_xz(point: Vector3, angle: f32) -> Vector3 {
+    let cos_a = angle.cos();
+    let sin_a = angle.sin();
+    Vector3::new(
+        point.x * cos_a - point.z * sin_a,
+        point.y,
+        point.x * sin_a + point.z * cos_a,
+    )
+}
 fn reflect(incident: &Vector3, normal: &Vector3) -> Vector3 {
     *incident - *normal * 2.0 * incident.dot(*normal)
 }
@@ -46,8 +169,9 @@ pub fn cast_ray<T: RayIntersect>(
     ray_direction: &Vector3,
     objects: &[T],
     light: &Light,
-    texture_manager: &TextureManager, // <-- Pasa el texture manager
-) -> Color {
+    texture_manager: &TextureManager,
+    time: f32,
+)-> Color {
     let mut intersect = Intersect::empty();
     let mut zbuffer = f32::INFINITY;
 
@@ -65,16 +189,25 @@ pub fn cast_ray<T: RayIntersect>(
         return Color::new(204, 184, 204, 255);
     }
     
-    // --- NUEVA LÓGICA DE TEXTURA ---
     let mut diffuse_color = intersect.material.diffuse;
     if let Some(texture_id) = intersect.material.texture_id {
         if let Some(uv) = intersect.uv {
             if let Some(texture) = texture_manager.get_texture(texture_id) {
-                diffuse_color = color_to_vector3(texture.get_color(uv.x, uv.y));
+                let is_water = intersect.material.transparency > 0.1 && intersect.material.diffuse.y < 0.4;
+                
+                let (u, v) = if is_water {
+                    let wave = (time * 2.0 + intersect.point.x * 0.5 + intersect.point.z * 0.5).sin() * 0.02;
+                    let u = (uv.x + wave).fract();
+                    let v = (uv.y + time * 0.1).fract();
+                    (u, v)
+                } else {
+                    (uv.x, uv.y)
+                };
+
+                diffuse_color = color_to_vector3(texture.get_color(u, v));
             }
         }
     }
-    // ----------------------------
 
     let light_direction = (light.position - intersect.point).normalized();
     let view_direction = (*ray_origin - intersect.point).normalized();
@@ -101,12 +234,15 @@ pub fn cast_ray<T: RayIntersect>(
     vector3_to_color(color)
 }
 
-pub fn render<T: RayIntersect>(
+
+pub fn render<T: RayIntersect + Clone + Sync>(
     framebuffer: &mut Framebuffer, 
     objects: &[T], 
     camera: &Camera, 
     light: &Light,
-    texture_manager: &TextureManager, // <-- Pasa el texture manager
+    texture_manager: &TextureManager,
+    time: f32,
+    should_abort: &AtomicBool,
 ) {
     let width = framebuffer.width as f32;
     let height = framebuffer.height as f32;
@@ -114,23 +250,50 @@ pub fn render<T: RayIntersect>(
     let fov = PI / 3.0;
     let perspective_scale = (fov * 0.5).tan();
 
-    for y in 0..framebuffer.height {
-        for x in 0..framebuffer.width {
-            let screen_x = (2.0 * x as f32) / width - 1.0;
-            let screen_y = -(2.0 * y as f32) / height + 1.0;
+    let total_pixels = (framebuffer.width * framebuffer.height) as usize;
+    let mut output_buffer = vec![Color::BLACK; total_pixels];
 
-            let screen_x = screen_x * aspect_ratio * perspective_scale;
-            let screen_y = screen_y * perspective_scale;
+    let num_threads = rayon::current_num_threads();
+    let chunk_size = (total_pixels + num_threads - 1) / num_threads;
 
-            let ray_direction = Vector3::new(screen_x, screen_y, -1.0).normalized();
-            let rotated_direction = camera.basis_change(&ray_direction);
+    output_buffer
+        .par_chunks_mut(chunk_size)
+        .enumerate()
+        .for_each(|(chunk_idx, chunk)| {
+            if should_abort.load(Ordering::Relaxed) {
+                return;
+            }
 
-            let pixel_color = cast_ray(&camera.eye, &rotated_direction, objects, light, texture_manager); // <-- Pasa el texture manager
+            let start_idx = chunk_idx * chunk_size;
+            for (i, pixel) in chunk.iter_mut().enumerate() {
+                if should_abort.load(Ordering::Relaxed) {
+                    return;
+                }
 
-            framebuffer.set_current_color(pixel_color);
-            framebuffer.set_pixel(x, y);
-        }
-    }
+                let flat_idx = start_idx + i;
+                let x = (flat_idx % framebuffer.width as usize) as f32;
+                let y = (flat_idx / framebuffer.width as usize) as f32;
+
+                let screen_x = (2.0 * x) / width - 1.0;
+                let screen_y = -(2.0 * y) / height + 1.0;
+                let screen_x = screen_x * aspect_ratio * perspective_scale;
+                let screen_y = screen_y * perspective_scale;
+
+                let ray_direction = Vector3::new(screen_x, screen_y, -1.0).normalized();
+                let rotated_direction = camera.basis_change(&ray_direction);
+
+                *pixel = cast_ray(
+                    &camera.eye,
+                    &rotated_direction,
+                    objects,
+                    light,
+                    texture_manager,
+                    time,
+                );
+            }
+        });
+
+    framebuffer.color_buffer = output_buffer;
 }
 fn main() {
     let window_width = 1000;
@@ -367,35 +530,85 @@ fn main() {
         }
     }
 
-    let mut camera = Camera::new(
-        Vector3::new(1.5, 0.6, 12.0),
-        Vector3::new(-0.5, 1.1, 1.0),
-        Vector3::new(0.0, 6.0, 0.0),
-    );
-    camera.orbit(-0.3, 0.20);
-    let rotation_speed = PI / 100.0;
+    // ... antes del loop ...
 
-    let light = Light::new(
-        Vector3::new(0.0, 2.0, 4.0),
-        Vector3::new(1.0, 1.0, 1.0),
-        0.5,
-    );
+let mut camera = Camera::new(
+    Vector3::new(1.5, 0.6, 12.0),
+    Vector3::new(-0.5, 1.1, 1.0),
+    Vector3::new(0.0, 6.0, 0.0),
+);
+camera.orbit(-0.3, 0.20);
 
-    while !window.window_should_close() {
-        let dt = window.get_frame_time();
-        framebuffer.clear();
+let light = Light::new(
+    Vector3::new(0.0, 2.0, 4.0),
+    Vector3::new(1.0, 1.0, 1.0),
+    0.5,
+);
 
-        // ... controles de cámara ...
-        // velocidad angular en rad/seg (ajústala a tu gusto)
-        let orbit_speed: f32 = 2.2; // ≈126°/s
+let mut scene_state = SceneState::new();
+camera.center = scene_state.camera_center;
 
-        if window.is_key_down(KeyboardKey::KEY_LEFT)  { camera.orbit( orbit_speed * dt, 0.0); }
-        if window.is_key_down(KeyboardKey::KEY_RIGHT) { camera.orbit(-orbit_speed * dt, 0.0); }
-        if window.is_key_down(KeyboardKey::KEY_UP)    { camera.orbit(0.0, -orbit_speed * dt); }
-        if window.is_key_down(KeyboardKey::KEY_DOWN)  { camera.orbit(0.0,  orbit_speed * dt); }
+let should_abort = Arc::new(AtomicBool::new(false)); // para threads
 
-        render(&mut framebuffer, &objects, &camera, &light, &texture_manager); 
+while !window.window_should_close() {
+    let dt = window.get_frame_time();
+    scene_state.update(dt);
 
-        framebuffer.swap_buffers(&mut window, &raylib_thread);
+    // --- ZOOM con rueda del mouse ---
+    let wheel = window.get_mouse_wheel_move();
+    if wheel != 0.0 {
+        scene_state.camera_distance = (scene_state.camera_distance - wheel * 1.5).clamp(3.0, 30.0);
+        let dir = (camera.eye - camera.center).normalized();
+        camera.eye = camera.center + dir * scene_state.camera_distance;
     }
+
+    // --- Control orbital ---
+    let orbit_speed: f32 = 2.2;
+    if window.is_key_down(KeyboardKey::KEY_LEFT)  { camera.orbit( orbit_speed * dt, 0.0); }
+    if window.is_key_down(KeyboardKey::KEY_RIGHT) { camera.orbit(-orbit_speed * dt, 0.0); }
+    if window.is_key_down(KeyboardKey::KEY_UP)    { camera.orbit(0.0, -orbit_speed * dt); }
+    if window.is_key_down(KeyboardKey::KEY_DOWN)  { camera.orbit(0.0,  orbit_speed * dt); }
+
+    // Actualizar luz y fondo
+    let sun_pos = scene_state.sun_position();
+    let light = Light::new(
+        sun_pos,
+        Vector3::new(1.0, 1.0, 1.0),
+        scene_state.light_intensity(),
+    );
+
+    framebuffer.set_background_color(scene_state.background_color());
+    framebuffer.clear();
+
+    // Render con threads
+    should_abort.store(false, Ordering::Relaxed);
+    render(
+        &mut framebuffer,
+        &objects, // <-- sin rotación
+        &camera,
+        &light,
+        &texture_manager,
+        scene_state.time,
+        &should_abort,
+    );
+
+    // Dibujar sol en pantalla
+    {
+        let mut drawing = window.begin_drawing(&raylib_thread);
+        let sun_screen_x = (sun_pos.x / 20.0 * 0.5 + 0.5) * drawing.get_screen_width() as f32;
+        let sun_screen_y = (1.0 - (sun_pos.y / 20.0 * 0.5 + 0.5)) * drawing.get_screen_height() as f32;
+
+        if sun_pos.y > 0.0 {
+            let radius = 20.0 * (sun_pos.y / 20.0).powf(2.0);
+            drawing.draw_circle(
+                sun_screen_x as i32,
+                sun_screen_y as i32,
+                radius.max(5.0) as f32,
+                scene_state.sun_color(),
+            );
+        }
+    }
+
+    framebuffer.swap_buffers(&mut window, &raylib_thread);
+}
 }

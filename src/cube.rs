@@ -4,7 +4,7 @@
 use crate::ray_intersect::{RayIntersect, Intersect};
 use crate::material::Material;
 use raylib::prelude::{Vector2, Vector3}; // <-- Añade Vector2
-
+#[derive(Clone)]
 pub struct Cube {
     pub center: Vector3,
     pub size: f32,
